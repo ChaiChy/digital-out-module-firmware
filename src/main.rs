@@ -1,15 +1,11 @@
-//! Blinks the LED on a Pico board
-//!
-//! This will blink an LED attached to GP25, which is the pin the Pico uses for the on-board LED.
 #![no_std]
 #![no_main]
 
 use core::fmt::Write;
 
 use bsp::entry;
-use defmt::*;
 use defmt_rtt as _;
-use embedded_hal::digital::{OutputPin, PinState};
+use embedded_hal::digital::{OutputPin, PinState, StatefulOutputPin};
 use panic_probe as _;
 
 use heapless::String;
@@ -40,9 +36,14 @@ fn set_pin_state<GPIO: PinId, F: Function, P: PullType>(val: u16, bit: u8, pin: 
         pin.set_low()
     }
 }
+
+fn read_pin_state<GPIO: PinId, F: Function, P: PullType>(pin: &mut bsp::hal::gpio::Pin<GPIO, F, P>)-> Result<bool, <bsp::hal::gpio::Pin<GPIO, F, P> as embedded_hal::digital::ErrorType>::Error> where bsp::hal::gpio::Pin<GPIO, F, P>: OutputPin + StatefulOutputPin{
+    pin.is_set_high()
+}
+
 #[entry]
 fn main() -> ! {
-    info!("Program start");
+
     let mut pac = pac::Peripherals::take().unwrap();
     let core = pac::CorePeripherals::take().unwrap();
     let mut watchdog = Watchdog::new(pac.WATCHDOG);
@@ -74,11 +75,14 @@ fn main() -> ! {
     // set up a serial port to listen from
     let mut serial = SerialPort::new(&usb_bus);
 
-    let mut do_module_usb_device = UsbDeviceBuilder::new(&usb_bus, UsbVidPid(0x1, 0x2))
+    // serial_id of device
+    let serial_id = "2";
+    
+    let mut do_module_usb_device = UsbDeviceBuilder::new(&usb_bus, UsbVidPid(0xf00d, 0xbabe))
         .strings(&[StringDescriptors::default()
-            .manufacturer("Slavery AG")
-            .product("Temu Lite")
-            .serial_number("Test")])
+            .manufacturer("Rocket Factory Augsburg")
+            .product("HIL Testbench [DIGITAL OUT]")
+            .serial_number(serial_id)])
         .unwrap()
         .device_class(USB_CLASS_CDC)
         .build();
@@ -107,6 +111,11 @@ fn main() -> ! {
     let mut do_9 = pins.gpio8.into_push_pull_output();
     let mut do_10 = pins.gpio9.into_push_pull_output();
 
+    //let do_pins = [&mut do_1, &mut do_2, &mut do_3, &mut do_4, &mut do_5, &mut do_6, &mut do_7, &mut do_8, &mut do_9, &mut do_10];
+    let do_pins: [&mut dyn OutputPin<Error = _>; 1] = [&mut do_1];
+    do_pins.iter_mut().enumerate().for_each(|(index, pin)| {
+        pin.set_high().unwrap();
+    });
 
     // operation starts here: poll serial port to check for changes and update digital outputs
     loop {
@@ -131,23 +140,35 @@ fn main() -> ! {
 
                     let received_value = u16::from_le_bytes([buffer[0], buffer[1]]);
 
-                    // set do_0 to high or low based on val
-                    set_pin_state(received_value, 0, &mut do_1).unwrap();
-                    set_pin_state(received_value, 1, &mut do_2).unwrap();
-                    set_pin_state(received_value, 2, &mut do_3).unwrap();
-                    set_pin_state(received_value, 3, &mut do_4).unwrap();
-                    set_pin_state(received_value, 4, &mut do_5).unwrap();
-                    set_pin_state(received_value, 5, &mut do_6).unwrap();
-                    set_pin_state(received_value, 6, &mut do_7).unwrap();
-                    set_pin_state(received_value, 7, &mut do_8).unwrap();
-                    set_pin_state(received_value, 8, &mut do_9).unwrap();
-                    set_pin_state(received_value, 9, &mut do_10).unwrap();
+                    let addressed_serial_id = (received_value >> 11) & 0x1F;
+                    let rw_bit = (received_value >> 10) & 0x01;
+                    
+                    if addressed_serial_id != serial_id.parse::<u16>().unwrap() {
+                        
+                        // payload is a write command
+                        if rw_bit == 1 {
+                            let new_do_state = received_value & 0x3FF;
+                            
+                            for (idx, pin) in do_pins.iter_mut().enumerate() {
+                                set_pin_state(new_do_state, idx, pin).unwrap();
+                            }
 
+                            let mut text: String<64> = String::new();
+                            writeln!(&mut text, "new digital out state: {}\r\n", new_do_state).unwrap();
+                        }
+                        // payload is a read command
+                        else if  rw_bit == 0 {
+                            let mut pin_state = 0;
+                            for (idx, pin) in do_pins.iter_mut().enumerate() {
+                                let bit = read_pin_state(pin).unwrap() as u16;
+                                pin_state |= bit << idx;
+                            }
+                        }
+
+                    }
                     let mut text: String<64> = String::new();
                     writeln!(&mut text, "received val: {}\r\n", received_value).unwrap();
                     
-                    let _ = serial.write(text.as_bytes());
-                    let _ = delay.delay_ms(1000_u32);
                 }
             }
 
